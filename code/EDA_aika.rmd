@@ -1,0 +1,424 @@
+---
+title: "aika_EDA"
+author: "Ishmanova Aiya, Gavrilova Sofiia, Shaidullina Valeriia, Khrikadze Salome"
+date: "06 06 2022"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages(library(tidyverse)) 
+suppressPackageStartupMessages(library(ggthemes))
+suppressPackageStartupMessages(library(gganimate))
+suppressPackageStartupMessages(library(prophet))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(glue))
+suppressPackageStartupMessages(library(forecast))
+suppressPackageStartupMessages(library(lubridate))
+```
+
+
+```{r}
+cumunique <- function(a) cumsum(!duplicated(a))
+
+give_season <- function(current_date){
+  case_when(lubridate::month(current_date) %in% c(12,1,2) ~ 'Winter',
+                      lubridate::month(current_date) %between% c(3,5)~ 'Spring',
+                      lubridate::month(current_date) %between% c(6,8)~ 'Summer',
+                      lubridate::month(current_date) %between% c(9,11)~ 'Fall')
+}
+
+give_day <- function(x){
+  current_date <- as.Date('1914-01-24') + x
+  season <- give_season(current_date)
+  return(paste0(as.character(current_date), ' : ',season))
+}
+
+read_daily_discharge_file <- function(path_to_file){
+    return(read.csv(path_to_file, skip = 36, sep = ';') %>% 
+                       .[,-2] %>% 
+                       transmute(date = YYYY.MM.DD %>% as.Date(), discharge = Value) %>% 
+                       mutate(station = path_to_file %>% gsub('[[:punct:]]|[[:alpha:]]','',.) %>%  parse_integer()))
+}
+
+read_header <- function(path_to_file){
+  return(readLines(path_to_file, n = 36))
+}
+
+give_lon_lat <- function(path_to_file){
+  vec_header <- read_header(path_to_file)
+  return(tibble(station = path_to_file %>% gsub('[[:punct:]]|[[:alpha:]]','',.) %>%  parse_integer(),
+                river = vec_header[grepl('River', vec_header)] %>% strsplit(., '\\:') %>% .[[1]] %>% trimws() %>% .[2], 
+                long = vec_header[grepl('Longitude', vec_header)] %>% strsplit(., '\\:') %>% .[[1]] %>% trimws() %>% .[2] %>% as.double(),
+                lat = vec_header[grepl('Latitude', vec_header)] %>% strsplit(., '\\:') %>% .[[1]] %>% trimws() %>% .[2] %>% as.double()))
+}
+
+
+
+
+```
+
+```{r}
+season_plot_average_flows <- function(df_data, how_many_years = 5, random_year = T, start_year = NULL){
+  give_start <- function(vec_dates){
+		min_Date <- vec_dates %>% min()
+		return(c(lubridate::year(min_Date), lubridate::month(min_Date), lubridate::day(min_Date)))
+	}
+
+	give_end <- function(vec_dates){
+		max_Date <- vec_dates %>% max()
+		return(c(lubridate::year(max_Date), lubridate::month(max_Date), lubridate::day(max_Date)))
+	}
+
+if(random_year){random_year_start <- sample(df_data$date %>% lubridate::year() %>% unique(),1)}else{random_year_start <- start_year}
+how_many_years <- how_many_years
+
+filtered_data <- df_data %>% 
+  dplyr::filter(lubridate::year(date) %between% c(random_year_start, random_year_start + how_many_years)) %>%
+  dplyr::select(date, discharge) %>%
+  mutate(monthly = floor_date(date, "month"))
+
+flow_monthly <- ddply(filtered_data, "monthly", summarise, monthly_average_flow = mean(discharge))
+
+tmp_ts <- stats::ts(flow_monthly$monthly_average_flow, 
+							frequency = 12, 
+							start = give_start(flow_monthly$monthly)[-3], 
+							end = give_end(flow_monthly$monthly)[-3])
+
+seasonplot(tmp_ts, 12, year.labels=TRUE, main="Average flows") 
+abline(v = 6, col = 'red')
+abline(v = 8, col = 'red')
+abline(v = 1, col = 'blue')
+abline(v = 11, col = 'blue')
+}
+```
+
+```{r}
+complete_ts <- function(ts_df, date_col, value_col){
+
+	mean_na <- function(x,y){
+		mean(c(x,y) , na.rm = T)
+	}
+	mean_na_V <- Vectorize(mean_na)
+
+	give_gaps <- function(q){
+		dates1 <- sort(as.Date(q))
+		list_of_gaps <- split(dates1, cumsum(c(TRUE, diff(dates1) != 1)))
+		return(list_of_gaps)
+	}
+
+	give_start <- function(vec_dates){
+		min_Date <- vec_dates %>% min()
+		return(c(lubridate::year(min_Date), lubridate::month(min_Date), lubridate::day(min_Date)))
+	}
+
+	give_end <- function(vec_dates){
+		max_Date <- vec_dates %>% max()
+		return(c(lubridate::year(max_Date), lubridate::month(max_Date), lubridate::day(max_Date)))
+	}
+
+	tmp_df <- as_tibble(ts_df)[, c(date_col, value_col)]
+	max_date <- tmp_df[[date_col]] %>% max
+	min_date <- tmp_df[[date_col]] %>% min
+	difference_dates <- max_date - min_date
+	complete_dates <- as.character(min_date + 0:difference_dates)
+	actual_dates <- as.character(ts_df[[date_col]])
+	missing_dates <- setdiff(complete_dates, actual_dates)
+
+	if(length(missing_dates) == 0){
+		cat('No missing values detected', sep = '\n')
+		return(ts_df %>% mutate(imputed = F))
+	}
+
+	gaps <- give_gaps(missing_dates)
+
+	are_there_big_gaps <- sapply(gaps, function(x){length(x) > 1}) %>% any()
+	
+	if(are_there_big_gaps){
+
+		data_for_imputation <- tmp_df
+
+		for(j in seq_along(gaps)){
+			cat(paste0('predicting ', j,'-th gap out of ', length(gaps),' using prophet'), sep = '\n')
+			min_el <- gaps[[j]] %>% as.Date() %>% min()
+			filtered_data_for_arima <- data_for_imputation %>% dplyr::filter(date < min_el)
+
+
+			m <- prophet(filtered_data_for_arima %>% rename(ds = date, y = discharge))
+			future <- make_future_dataframe(m, periods = length(gaps[[j]]))
+			forecasted_gap <- predict(m, future)			
+			cat(paste0(length(gaps[[j]]), ' values predicted using prophet'), sep = '\n')
+
+			forecasted_values <- forecasted_gap[c('ds', 'yhat')] %>% tail(length(gaps[[j]])) %>% transmute(date = ds %>% as.Date(), discharge = yhat)
+			data_for_imputation <- bind_rows(data_for_imputation, forecasted_values) %>% arrange(date)
+		}
+
+		final_data <- data_for_imputation %>% 
+			left_join(lapply(gaps, function(x) tibble(date = x %>% as.Date(), imputed = T)) %>% rbindlist(), by = 'date') %>%
+			mutate(imputed = ifelse(is.na(imputed), F,imputed))
+
+		return(final_data)
+
+	}else{
+
+		missing_df <- tibble(date = as.Date(missing_dates), 
+					day_before = as.Date(missing_dates)-1,
+					day_after = as.Date(missing_dates)+1
+			) %>%
+		left_join(tmp_df %>% select(date, discharge_before = discharge), by = c( 'day_before' = 'date')) %>%
+		left_join(tmp_df %>% select(date, discharge_after = discharge), by = c( 'day_after' = 'date')) %>%
+		transmute(date, discharge =  map2_dbl(discharge_before, discharge_after, mean_na_V))
+
+		return(bind_rows(tmp_df %>% mutate(imputed = F), 
+				missing_df %>% mutate(imputed = T))
+			)
+	}
+	
+}
+```
+
+```{r}
+daily_discharge_by_seasons_plot <- function(df_data){
+  df_data %>%
+  mutate(season = give_season(date)) %>%
+  ggplot(aes(x = season, y = discharge, fill = season)) + 
+  geom_boxplot() + 
+  scale_y_log10() + 
+  coord_flip()
+}
+
+are_distributions_daily_discharge_different_by_seasons <- function(df_data){
+ df_data %>%
+  mutate(season = give_season(date)) %>%
+  kruskal.test(discharge ~ season, data = .)
+}
+
+monthly_discharge_by_seasons_plot <- function(df_data){
+  
+filtered_data <- df_data %>% 
+  dplyr::select(date, discharge) %>%
+  mutate(monthly = floor_date(date, "month"))
+
+flow_monthly <- ddply(filtered_data, "monthly", summarise, monthly_average_flow = mean(discharge))
+
+flow_monthly %>%
+  mutate(season = give_season(monthly)) %>%
+  ggplot(aes(x = season, y = monthly_average_flow, fill = season)) + 
+  geom_boxplot() + 
+  scale_y_log10() + 
+  coord_flip()
+}
+
+are_distributions_monthly_discharge_different_by_seasons <- function(df_data){
+  
+  filtered_data <- df_data %>% 
+  dplyr::select(date, discharge) %>%
+  mutate(monthly = floor_date(date, "month"))
+
+flow_monthly <- ddply(filtered_data, "monthly", summarise, monthly_average_flow = mean(discharge))
+
+  
+flow_monthly %>%
+  mutate(season = give_season(monthly)) %>%
+  kruskal.test(monthly_average_flow ~ season, data = .)
+}
+```
+
+```{r}
+daily_discharge_after_1990_plot <- function(df_data){
+  df_data %>%
+    mutate(after_1990 = ifelse(date > '1990-01-1',T,F)) %>%
+    ggplot(aes(x = after_1990, y = discharge, fill = after_1990)) + 
+    geom_boxplot() + 
+    scale_y_log10() + 
+    coord_flip()
+}
+
+are_distributions_daily_discharge_different_after_1990 <- function(df_data){
+  df_data %>%
+    mutate(after_1990 = ifelse(date > '1990-01-1',T,F)) %>%
+    kruskal.test(discharge ~ after_1990, data = .)
+}
+
+monthly_discharge_after_1990_plot <- function(df_data){
+
+  filtered_data<- df_data %>% 
+  dplyr::select(date, discharge) %>%
+  mutate(monthly = floor_date(date, "month"))
+
+flow_monthly <- ddply(filtered_data, "monthly", summarise, monthly_average_flow = mean(discharge))
+
+  flow_monthly %>%
+    mutate(after_1990 = ifelse(monthly > '1990-01-1',T,F)) %>%
+    ggplot(aes(x = after_1990, y = monthly_average_flow, fill = after_1990)) + 
+    geom_boxplot() + 
+    scale_y_log10() + 
+    coord_flip()
+}
+
+are_distributions_monthly_discharge_different_after_1990 <- function(df_data){
+  
+filtered_data<- df_data %>% 
+  dplyr::select(date, discharge) %>%
+  mutate(monthly = floor_date(date, "month"))
+
+flow_monthly <- ddply(filtered_data, "monthly", summarise, monthly_average_flow = mean(discharge))
+
+flow_monthly %>%
+  mutate(after_1990 = ifelse(monthly > '1990-01-1',T,F)) %>%
+  kruskal.test(monthly_average_flow ~ after_1990, data = .)
+}
+```
+
+```{r}
+stations <- rio::import("C:\\R\\eda_rhine\\data\\raw\\stations_project.xlsx")
+#stations_csv <- read_csv("C:\\R\\eda_rhine\\data\\raw\\runoff_stations.csv")
+grdc_selection <- read_csv("C:\\R\\eda_rhine\\data\\raw\\grdc_selection.csv")
+
+```
+
+```{r}
+all_files <- dir("C:\\R\\eda_rhine\\data\\raw\\", full.name = T) 
+valid_files <- all_files[grepl('Q_Day_Cmd', all_files)]
+daily_data <- lapply(valid_files, read_daily_discharge_file)
+
+names(daily_data) <- valid_files
+
+stations_long_lat <- lapply(valid_files, give_lon_lat) %>% 
+  rbindlist() 
+
+orange_river <- daily_data[1:7] %>% 
+  rbindlist() %>% 
+  left_join(stations_long_lat , by = "station") %>%
+  mutate(stations_long_lat = station %>% as.factor()) %>%
+  arrange(date) %>%
+  mutate(day_number = cumunique(date)) %>%
+  dplyr::filter(discharge != -999 & discharge != 0)
+
+vistula <- daily_data[8:9] %>% 
+  rbindlist() %>% 
+  left_join(stations_long_lat , by = 'station') %>%
+  mutate(station = station %>% as.factor()) %>%
+  arrange(date) %>%
+  mutate(day_number = cumunique(date)) %>%
+  dplyr::filter(discharge != -999 & discharge != 0)
+
+south_africa_data <- map_data('world') %>% 
+  as_tibble() %>% 
+  dplyr::filter(region == 'South Africa')
+
+poland_data <- map_data('world') %>% 
+  as_tibble() %>% 
+  dplyr::filter(region == 'Poland')
+```
+
+
+```{r}
+stations <- orange_river$station %>% unique() %>% as.character() %>% as.integer()
+list_of_corrected_dataframes_orange_river <- list()
+i <- 1
+for(station_i in stations){
+
+	list_of_corrected_dataframes_orange_river[[i]] <- orange_river %>% 
+		dplyr::filter(station == station_i) %>% 
+		complete_ts(., 'date', 'discharge')
+	i <- i + 1
+}
+#saveRDS(list_of_corrected_dataframes_orange_river, 'list_of_corrected_dataframes_orange_river.rds')
+```
+
+
+```{r}
+stations <- vistula$station %>% unique() %>% as.character() %>% as.integer()
+list_of_corrected_dataframes_vistula <- list()
+i <- 1
+for(station_i in stations){
+
+	list_of_corrected_dataframes_vistula[[i]] <- vistula %>% 
+		dplyr::filter(station == station_i) %>% 
+		complete_ts(., 'date', 'discharge')
+	i <- i + 1
+}
+#saveRDS(list_of_corrected_dataframes_vistula, 'list_of_corrected_dataframes_vistula.rds')
+```
+
+```{r}
+data_before_1990 <- list_of_corrected_dataframes_vistula %>% rbindlist() %>% dplyr::filter(station == 6458450 & lubridate::year(date) <= 1990)
+
+m <- prophet(data_before_1990 %>% dplyr::select(ds = date, y = discharge))
+future <- make_future_dataframe(m, periods = 10895)
+forecasted_gap <- predict(m, future)			
+
+forecasted_values <- forecasted_gap[c('ds', 'yhat')] %>% transmute(date = ds %>% as.Date(), discharge = yhat, predicted = T)
+```
+
+
+```{r}
+list_of_corrected_dataframes_vistula %>% 
+  rbindlist() %>% 
+  dplyr::filter(station == 6458450) %>% 
+  mutate(predicted = F) %>% 
+  bind_rows(forecasted_values) %>%
+  ggplot(aes(x = date, y = discharge, color = predicted)) + 
+  geom_line()
+```
+
+```{r}
+list_of_corrected_dataframes_vistula %>% 
+  rbindlist() %>% 
+  dplyr::filter(station == 6458450) %>%
+  season_plot_average_flows(., how_many_years = 5)
+
+```
+
+```{r}
+list_of_corrected_dataframes_vistula %>% 
+  rbindlist() %>% 
+  dplyr::filter(station == 6458010) %>%
+  season_plot_average_flows(., how_many_years = 5)
+```
+
+
+
+```{r}
+list_of_corrected_dataframes_vistula %>% 
+  rbindlist() %>% 
+  dplyr::filter(station == 6458450) %>%
+  daily_discharge_by_seasons_plot()
+```
+
+```{r}
+list_of_corrected_dataframes_vistula %>% 
+  rbindlist() %>% 
+  dplyr::filter(station == 6458010) %>% 
+  are_distributions_daily_discharge_different_by_seasons()
+```
+
+```{r}
+list_of_corrected_dataframes_vistula %>% 
+  rbindlist() %>% 
+  dplyr::filter(station == 6458010) %>% 
+  monthly_discharge_by_seasons_plot()
+```
+
+```{r}
+list_of_corrected_dataframes_vistula %>% 
+  rbindlist() %>% 
+  dplyr::filter(station == 6458450) %>%
+  are_distributions_monthly_discharge_different_by_seasons()
+```
+
+
+```{r}
+list_of_corrected_dataframes_vistula %>% 
+  rbindlist() %>% 
+  dplyr::filter(station == 6458010) %>%
+  monthly_discharge_after_1990_plot()
+```
+
+```{r}
+list_of_corrected_dataframes_vistula %>% 
+  rbindlist() %>% 
+  dplyr::filter(station == 6458450) %>%
+  are_distributions_monthly_discharge_different_after_1990()
+```
